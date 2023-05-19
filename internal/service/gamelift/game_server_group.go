@@ -10,9 +10,6 @@ import ( // nosemgrep:ci.semgrep.aws.multiple-service-imports
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/autoscaling"
-	"github.com/aws/aws-sdk-go/service/gamelift"
 	"github.com/hashicorp/aws-sdk-go-base/v2/awsv1shim/v2/tfawserr"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
@@ -21,10 +18,14 @@ import ( // nosemgrep:ci.semgrep.aws.multiple-service-imports
 	"github.com/hashicorp/terraform-provider-aws/internal/conns"
 	"github.com/hashicorp/terraform-provider-aws/internal/errs/sdkdiag"
 	"github.com/hashicorp/terraform-provider-aws/internal/flex"
-	tftags "github.com/hashicorp/terraform-provider-aws/internal/tags"
+	"github.com/hashicorp/terraform-provider-aws/internal/tags"
 	"github.com/hashicorp/terraform-provider-aws/internal/tfresource"
 	"github.com/hashicorp/terraform-provider-aws/internal/verify"
 	"github.com/hashicorp/terraform-provider-aws/names"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/autoscaling"
+	"github.com/aws/aws-sdk-go/service/gamelift"
 )
 
 const (
@@ -176,8 +177,8 @@ func ResourceGameServerGroup() *schema.Resource {
 				Required:     true,
 				ValidateFunc: verify.ValidARN,
 			},
-			names.AttrTags:    tftags.TagsSchema(),
-			names.AttrTagsAll: tftags.TagsSchemaComputed(),
+			names.AttrTags:    tags.TagsSchema(),
+			names.AttrTagsAll: tags.TagsSchemaComputed(),
 			"vpc_subnets": {
 				Type:     schema.TypeSet,
 				Optional: true,
@@ -238,13 +239,8 @@ func resourceGameServerGroupCreate(ctx context.Context, d *schema.ResourceData, 
 
 		return nil
 	})
-
-	if tfresource.TimedOut(err) {
-		out, err = conn.CreateGameServerGroupWithContext(ctx, input)
-	}
-
 	if err != nil {
-		return sdkdiag.AppendErrorf(diags, "creating GameLift Game Server Group (%s): %s", d.Get("name").(string), err)
+		return sdkdiag.AppendErrorf(diags, "creating GameLift Game Server Group (%s): %s", d.Get("game_server_group_name").(string), err)
 	}
 
 	d.SetId(aws.StringValue(out.GameServerGroup.GameServerGroupName))
@@ -257,42 +253,23 @@ func resourceGameServerGroupCreate(ctx context.Context, d *schema.ResourceData, 
 }
 
 func resourceGameServerGroupRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
-	var diags diag.Diagnostics
-	conn := meta.(*conns.AWSClient).GameLiftConn(ctx)
-	autoscalingConn := meta.(*conns.AWSClient).AutoScalingConn(ctx)
-
-	gameServerGroupName := d.Id()
+	var (
+		diags               diag.Diagnostics
+		conn                = meta.(*conns.AWSClient).GameLiftConn(ctx)
+		autoscalingConn     = meta.(*conns.AWSClient).AutoScalingConn(ctx)
+		gameServerGroupName = d.Id()
+	)
 
 	gameServerGroup, err := FindGameServerGroupByName(ctx, conn, gameServerGroupName)
-	if !d.IsNewResource() && tfresource.NotFound(err) {
-		log.Printf("[WARN] GameLift Game Server Group (%s) not found, removing from state", gameServerGroupName)
-		d.SetId("")
-		return diags
-	}
-
 	if err != nil {
+		if tfresource.NotFound(err) && !d.IsNewResource() {
+			log.Printf("[WARN] GameLift Game Server Group (%s) not found, removing from state", gameServerGroupName)
+			d.SetId("")
+
+			return diags
+		}
+
 		return sdkdiag.AppendErrorf(diags, "reading GameLift Game Server Group (%s): %s", gameServerGroupName, err)
-	}
-
-	autoScalingGroupName := strings.Split(aws.StringValue(gameServerGroup.AutoScalingGroupArn), "/")[1]
-	autoScalingGroupOutput, err := autoscalingConn.DescribeAutoScalingGroupsWithContext(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: []*string{aws.String(autoScalingGroupName)},
-	})
-	if err != nil {
-		return sdkdiag.AppendErrorf(diags, "reading GameLift Game Server Group (%s): reading AutoScaling Group: %s", gameServerGroupName, err)
-	}
-	if autoScalingGroupOutput == nil || len(autoScalingGroupOutput.AutoScalingGroups) == 0 {
-		return sdkdiag.AppendErrorf(diags, "describing Auto Scaling Group (%s): not found", autoScalingGroupName)
-	}
-	autoScalingGroup := autoScalingGroupOutput.AutoScalingGroups[0]
-
-	describePoliciesOutput, err := autoscalingConn.DescribePoliciesWithContext(ctx, &autoscaling.DescribePoliciesInput{
-		AutoScalingGroupName: aws.String(autoScalingGroupName),
-		PolicyNames:          []*string{aws.String(gameServerGroupName)},
-	})
-
-	if err != nil {
-		return sdkdiag.AppendErrorf(diags, "describing Auto Scaling Group Policies (%s): %s", autoScalingGroupName, err)
 	}
 
 	arn := aws.StringValue(gameServerGroup.GameServerGroupArn)
@@ -301,24 +278,49 @@ func resourceGameServerGroupRead(ctx context.Context, d *schema.ResourceData, me
 	d.Set("balancing_strategy", gameServerGroup.BalancingStrategy)
 	d.Set("game_server_group_name", gameServerGroupName)
 	d.Set("game_server_protection_policy", gameServerGroup.GameServerProtectionPolicy)
-	d.Set("max_size", autoScalingGroup.MaxSize)
-	d.Set("min_size", autoScalingGroup.MinSize)
-	d.Set("role_arn", gameServerGroup.RoleArn)
-
-	if len(describePoliciesOutput.ScalingPolicies) == 1 {
-		if err := d.Set("auto_scaling_policy", []interface{}{flattenGameServerGroupAutoScalingPolicy(describePoliciesOutput.ScalingPolicies[0])}); err != nil {
-			return sdkdiag.AppendErrorf(diags, "setting auto_scaling_policy: %s", err)
-		}
-	} else {
-		d.Set("auto_scaling_policy", nil)
-	}
 
 	if err := d.Set("instance_definition", flattenInstanceDefinitions(gameServerGroup.InstanceDefinitions)); err != nil {
 		return sdkdiag.AppendErrorf(diags, "setting instance_definition: %s", err)
 	}
 
-	if err := d.Set("launch_template", flattenAutoScalingLaunchTemplateSpecification(autoScalingGroup.MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification)); err != nil {
-		return sdkdiag.AppendErrorf(diags, "setting launch_template: %s", err)
+	// Check the game server group currently has an ASG
+	if aws.StringValue(gameServerGroup.AutoScalingGroupArn) != "" {
+		autoScalingGroupName := strings.Split(aws.StringValue(gameServerGroup.AutoScalingGroupArn), "/")[1]
+
+		autoScalingGroupOutput, err := autoscalingConn.DescribeAutoScalingGroupsWithContext(ctx, &autoscaling.DescribeAutoScalingGroupsInput{
+			AutoScalingGroupNames: aws.StringSlice([]string{autoScalingGroupName}),
+		})
+		if err != nil {
+			return sdkdiag.AppendErrorf(diags, "reading GameLift Game Server Group (%s): reading AutoScaling Group: %s", gameServerGroupName, err)
+		} else if autoScalingGroupOutput == nil || len(autoScalingGroupOutput.AutoScalingGroups) == 0 {
+			return sdkdiag.AppendErrorf(diags, "describing Auto Scaling Group (%s): not found", autoScalingGroupName)
+		}
+
+		autoScalingGroup := autoScalingGroupOutput.AutoScalingGroups[0]
+
+		describePoliciesOutput, err := autoscalingConn.DescribePoliciesWithContext(ctx, &autoscaling.DescribePoliciesInput{
+			AutoScalingGroupName: aws.String(autoScalingGroupName),
+			PolicyNames:          aws.StringSlice([]string{gameServerGroupName}),
+		})
+		if err != nil {
+			return sdkdiag.AppendErrorf(diags, "describing Auto Scaling Group Policies (%s): %s", autoScalingGroupName, err)
+		}
+
+		d.Set("max_size", autoScalingGroup.MaxSize)
+		d.Set("min_size", autoScalingGroup.MinSize)
+		d.Set("role_arn", gameServerGroup.RoleArn)
+
+		if len(describePoliciesOutput.ScalingPolicies) == 1 {
+			if err := d.Set("auto_scaling_policy", []interface{}{flattenGameServerGroupAutoScalingPolicy(describePoliciesOutput.ScalingPolicies[0])}); err != nil {
+				return sdkdiag.AppendErrorf(diags, "setting auto_scaling_policy: %s", err)
+			}
+		} else {
+			d.Set("auto_scaling_policy", nil)
+		}
+
+		if err := d.Set("launch_template", flattenAutoScalingLaunchTemplateSpecification(autoScalingGroup.MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification)); err != nil {
+			return sdkdiag.AppendErrorf(diags, "setting launch_template: %s", err)
+		}
 	}
 
 	return diags
