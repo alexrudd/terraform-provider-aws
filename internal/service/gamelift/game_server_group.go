@@ -318,7 +318,7 @@ func resourceGameServerGroupRead(ctx context.Context, d *schema.ResourceData, me
 			d.Set("auto_scaling_policy", nil)
 		}
 
-		if err := d.Set("launch_template", flattenAutoScalingLaunchTemplateSpecification(autoScalingGroup.MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification)); err != nil {
+		if err := d.Set("launch_template", flattenAutoScalingLaunchTemplateSpecification(autoScalingGroup.LaunchTemplate)); err != nil {
 			return sdkdiag.AppendErrorf(diags, "setting launch_template: %s", err)
 		}
 	}
